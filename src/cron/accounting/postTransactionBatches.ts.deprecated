@@ -1,0 +1,363 @@
+import {
+    FundTransactionBatchStatusValue,
+    FundTransactionBatchTypeValue
+} from '../../models/FundTransactionBatch';
+import { TransactionTypeValue } from '../../models/TransactionType';
+import { GLAccountTypeName } from '../../models/GLAccountType';
+import {
+    Fund,
+    FundTransaction,
+    FundTransactionBatch,
+    FundInvestment,
+    GLAccount,
+    Investment,
+    FundTransactionDetail,
+    Tenant,
+    UserProfile
+} from '../../models';
+import { AccountingFacade, JournalEntryInterface } from '../../accounting';
+import { GLAccountRepository } from '../../repositories/GLAccount';
+import { TenantRepository } from '../../repositories/Tenant';
+import { LocationEntityRepository } from '../../repositories/LocationEntity';
+import { getOrCreateConnection } from '../../typeorm';
+import dayjs from 'dayjs';
+
+type TransactionsByFund = Record<
+    string,
+    { customerId: string; transactions: FundTransaction[]; fund: Fund }
+>;
+
+type InvestmentsByAccountNumber = Record<string, { total: number; name: string }>;
+
+export async function postTransactionBatches() {
+    const accounting = new AccountingFacade();
+    const connection = await getOrCreateConnection();
+    const tenantRepo = connection.getCustomRepository(TenantRepository);
+    const batchRepo = connection.getRepository(FundTransactionBatch);
+    const glAccountRepo = connection.getCustomRepository(GLAccountRepository);
+
+    // Customer ID used for non-donor transactions, like investments
+    const dummyCustomerId = await tenantRepo.getSettingByKey('dummyCustomerId');
+    // Project ID used for tracking investments and divestments
+
+    // Location entity for all transactions related to DAFs
+    const dafLocationEntity = await connection
+        .getCustomRepository(LocationEntityRepository)
+        .getDAFLocationEntity();
+
+    // Account into which fund contributions are paid
+    const primaryGLAccount = await glAccountRepo.getByType(GLAccountTypeName.PRIMARY);
+    // Account into which funds are transferred before being transferred to investments
+    const poolPassthroughGLAccount = await glAccountRepo.getByType(
+        GLAccountTypeName.POOL_PASSTHROUGH
+    );
+    // Account into which funds are transferred before being paid to grant recipient
+    const grantDisbusementGLAccount = await glAccountRepo.getByType(
+        GLAccountTypeName.GRANT_DISBURSEMENT
+    );
+    // Account that tracks funds paid out to grant recipients
+    const grantRecipientGLAccount = await glAccountRepo.getByType(
+        GLAccountTypeName.GRANT_RECIPIENT
+    );
+
+    // Gets all complete transaction batches
+    async function getBatches(): Promise<FundTransactionBatch[]> {
+        const batches = await batchRepo
+            .createQueryBuilder('batch')
+            .leftJoinAndSelect('batch.fundTransactions', 'fundTransactions')
+            .leftJoinAndSelect('fundTransactions.transactionDetails', 'transactionDetails')
+            .leftJoinAndSelect('fundTransactions.fund', 'fund')
+            .leftJoinAndSelect('fundTransactions.transactionType', 'transactionType')
+            .leftJoinAndSelect('user_profile', 'user', 'fundTransactions.createdBy = user.id')
+            .leftJoinAndSelect('transactionDetails.fundInvestment', 'fundInvestment')
+            .leftJoinAndSelect('fundInvestment.investment', 'investment')
+            .leftJoinAndSelect('investment.glAccount', 'glAccount')
+            .andWhere('batch.ledgerId IS NULL')
+            .andWhere('batch.status = :status', {
+                status: FundTransactionBatchStatusValue.COMPLETE
+            })
+            .getMany();
+
+        return batches;
+    }
+
+    // Checks for the accounting-related fields on transaction and user
+    function hasRequiredFields(fund: Fund, user: UserProfile): boolean {
+        return user.accountingCustomerId !== null && fund.accountingProjectId !== null;
+    }
+
+    // Organizes transactions into groups by fund
+    async function groupTransactionsByFund(
+        transactions: FundTransaction[]
+    ): Promise<TransactionsByFund> {
+        const transactionsByFund: TransactionsByFund = {};
+        for (const transaction of transactions) {
+            const user = await connection.getRepository(UserProfile).findOne(transaction.createdBy);
+            const fund = transaction.fund;
+
+            // Skip if record is missing accounting-related fields
+            if (!hasRequiredFields(fund, user)) continue;
+
+            if (!(fund.id in transactionsByFund)) {
+                transactionsByFund[fund.id] = {
+                    customerId: user.accountingCustomerId,
+                    transactions: [],
+                    fund: fund
+                };
+            }
+            transactionsByFund[fund.id].transactions.push(transaction);
+        }
+        return transactionsByFund;
+    }
+
+    // Creates journal entries that record movement of funds from
+    // primary bank account into pool passthrough account
+    function createInvesmentPassthroughJournalEntries(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const journalEntries = [];
+
+        for (const fundId in transactionsByFund) {
+            const transactionData = transactionsByFund[fundId];
+            const totalAmount = transactionData.transactions.reduce((sum, transaction) => {
+                return sum + transaction.amount;
+            }, 0);
+
+            const passthroughCreditJournalEntry = accounting.createJournalEntryObject(
+                primaryGLAccount.accountNumber,
+                `Contributions for fund ${transactionData.fund.fundCode}`,
+                totalAmount * -1,
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId
+            );
+            const passthroughDebitJournalEntry = accounting.createJournalEntryObject(
+                poolPassthroughGLAccount.accountNumber,
+                `Contributions for fund ${transactionData.fund.fundCode}`,
+                totalAmount,
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId
+            );
+
+            journalEntries.push(passthroughCreditJournalEntry, passthroughDebitJournalEntry);
+        }
+
+        return journalEntries;
+    }
+
+    // Creates journal entries that record movement of funds from
+    // grant disbursement account to grant recipient
+    function createGrantDisbursementJournalEntries(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const journalEntries = [];
+
+        for (const fundId in transactionsByFund) {
+            const transactionData = transactionsByFund[fundId];
+            const totalAmount = transactionData.transactions.reduce((sum, transaction) => {
+                return sum + transaction.amount;
+            }, 0);
+
+            const passthroughCreditJournalEntry = accounting.createJournalEntryObject(
+                poolPassthroughGLAccount.accountNumber,
+                `Grant disbursement for fund ${transactionData.fund.fundCode}`,
+                totalAmount,
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId
+            );
+
+            const passthroughDebitJournalEntry = accounting.createJournalEntryObject(
+                grantDisbusementGLAccount.accountNumber,
+                `Grant disbursement for fund ${transactionData.fund.fundCode}`,
+                totalAmount * -1, // Flipping the sign on the debit entry because divestments are stored as negative values
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId
+            );
+
+            const disbursementCreditJournalEntry = accounting.createJournalEntryObject(
+                grantDisbusementGLAccount.accountNumber,
+                `Grant disbursement for fund ${transactionData.fund.fundCode}`,
+                totalAmount,
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId,
+                [['GLDIM990FUNCTIONAL_EXPENSE_GROUP', '10003']]
+            );
+
+            const disbursementDebitJournalEntry = accounting.createJournalEntryObject(
+                grantRecipientGLAccount.accountNumber,
+                `Grant disbursement for fund ${transactionData.fund.fundCode}`,
+                totalAmount * -1, // Flipping the sign on the debit entry because divestments are stored as negative values
+                transactionData.fund.accountingProjectId,
+                dummyCustomerId,
+                dafLocationEntity.locationId,
+                [['GLDIM990FUNCTIONAL_EXPENSE_GROUP', '10003']]
+            );
+            journalEntries.push(
+                passthroughCreditJournalEntry,
+                passthroughDebitJournalEntry,
+                disbursementCreditJournalEntry,
+                disbursementDebitJournalEntry
+            );
+        }
+
+        return journalEntries;
+    }
+
+    // Creates journal entries that record movement of funds from
+    // pool passthrough account into investment pools
+    function createInvestmentPoolJournalEntries(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const journalEntries = [];
+        for (const fundId in transactionsByFund) {
+            const transactionData = transactionsByFund[fundId];
+            const investmentTotalsByAccountNumber: InvestmentsByAccountNumber = {};
+            for (const transaction of transactionData.transactions) {
+                for (const detail of transaction.transactionDetails) {
+                    const investment = detail.fundInvestment.investment;
+                    const investmentGLAccountNumber = investment.glAccount.accountNumber;
+                    if (!(investmentGLAccountNumber in investmentTotalsByAccountNumber)) {
+                        investmentTotalsByAccountNumber[investmentGLAccountNumber] = {
+                            total: 0,
+                            name: investment.name
+                        };
+                    }
+                    investmentTotalsByAccountNumber[investmentGLAccountNumber].total +=
+                        detail.amount;
+                }
+            }
+
+            for (const investmentAccountNumber in investmentTotalsByAccountNumber) {
+                const investmentData = investmentTotalsByAccountNumber[investmentAccountNumber];
+                const investmentCreditJournalEntry = accounting.createJournalEntryObject(
+                    poolPassthroughGLAccount.accountNumber,
+                    `Investment into ${investmentData.name}`,
+                    investmentData.total * -1,
+                    transactionData.fund.accountingProjectId,
+                    dummyCustomerId,
+                    dafLocationEntity.locationId
+                );
+                const investmentDebitJournalEntry = accounting.createJournalEntryObject(
+                    investmentAccountNumber,
+                    `Investment into ${investmentData.name}`,
+                    investmentData.total,
+                    transactionData.fund.accountingProjectId,
+                    dummyCustomerId,
+                    dafLocationEntity.locationId
+                );
+
+                journalEntries.push(investmentDebitJournalEntry, investmentCreditJournalEntry);
+            }
+        }
+
+        return journalEntries;
+    }
+
+    // Creates journal entries that record movement of funds from
+    // investment pools into grant disbursement account
+    function createPoolDivestmentJournalEntries(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const journalEntries = [];
+        for (const fundId in transactionsByFund) {
+            const transactionData = transactionsByFund[fundId];
+            const investmentTotalsByAccountNumber: InvestmentsByAccountNumber = {};
+            for (const transaction of transactionData.transactions) {
+                for (const detail of transaction.transactionDetails) {
+                    const investment = detail.fundInvestment.investment;
+                    const investmentGLAccountNumber = investment.glAccount.accountNumber;
+                    if (!(investmentGLAccountNumber in investmentTotalsByAccountNumber)) {
+                        investmentTotalsByAccountNumber[investmentGLAccountNumber] = {
+                            total: 0,
+                            name: investment.name
+                        };
+                    }
+                    investmentTotalsByAccountNumber[investmentGLAccountNumber].total +=
+                        detail.amount;
+                }
+            }
+
+            for (const investmentAccountNumber in investmentTotalsByAccountNumber) {
+                const investmentData = investmentTotalsByAccountNumber[investmentAccountNumber];
+                const investmentCreditJournalEntry = accounting.createJournalEntryObject(
+                    investmentAccountNumber,
+                    `Divestment from ${investmentData.name}`,
+                    investmentData.total,
+                    transactionData.fund.accountingProjectId,
+                    dummyCustomerId,
+                    dafLocationEntity.locationId
+                );
+                const investmentDebitJournalEntry = accounting.createJournalEntryObject(
+                    poolPassthroughGLAccount.accountNumber,
+                    `Divestment from ${investmentData.name}`,
+                    investmentData.total * -1, // Flipping the sign on the debit entry because divestments are stored as negative values
+                    transactionData.fund.accountingProjectId,
+                    dummyCustomerId,
+                    dafLocationEntity.locationId
+                );
+
+                journalEntries.push(investmentDebitJournalEntry, investmentCreditJournalEntry);
+            }
+        }
+
+        return journalEntries;
+    }
+
+    function processInvestmentBatchTransactions(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const passthroughJournalEntries = createInvesmentPassthroughJournalEntries(
+            transactionsByFund
+        );
+        const investmentPoolJournalEntries = createInvestmentPoolJournalEntries(transactionsByFund);
+        return [...passthroughJournalEntries, ...investmentPoolJournalEntries];
+    }
+
+    function processGrantDivestmentBatchTransactions(
+        transactionsByFund: TransactionsByFund
+    ): JournalEntryInterface[] {
+        const poolDivestmentJournalEntries = createPoolDivestmentJournalEntries(transactionsByFund);
+        const disbursementJournalEntries = createGrantDisbursementJournalEntries(
+            transactionsByFund
+        );
+        return [...poolDivestmentJournalEntries, ...disbursementJournalEntries];
+    }
+
+    async function processFundTransactionBatches(transactionBatches: FundTransactionBatch[]) {
+        for (const batch of transactionBatches) {
+            const transactions = batch.fundTransactions;
+            const transactionsByFund = await groupTransactionsByFund(transactions);
+
+            const today = dayjs().format('YYYY-MM-DD HH:mm');
+            let journalEntries: JournalEntryInterface[];
+            let description: string;
+            if (batch.type === FundTransactionBatchTypeValue.INVESTMENT) {
+                journalEntries = processInvestmentBatchTransactions(transactionsByFund);
+                description = `Investment cash transfers for ${today}`;
+            } else if (batch.type === FundTransactionBatchTypeValue.DIVESTMENT) {
+                journalEntries = processGrantDivestmentBatchTransactions(transactionsByFund);
+                description = `Grant divestment cash transfers for ${today}`;
+            }
+
+            try {
+                const ledgerBatchId = await accounting.createJournalEntryBatch(
+                    journalEntries,
+                    description
+                );
+                batch.ledgerId = ledgerBatchId;
+                batchRepo.save(batch);
+            } catch (error) {
+                console.log(
+                    `Error creating Journal Entry Batch for FundTransactionBatch ${batch.id}: ${error}`
+                );
+            }
+        }
+    }
+
+    const batches = await getBatches();
+    await processFundTransactionBatches(batches);
+}

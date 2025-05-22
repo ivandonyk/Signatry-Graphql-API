@@ -1,0 +1,352 @@
+import { MigrationInterface, QueryRunner } from 'typeorm';
+
+export class ALTERTransactionDetailSearchVectorAddAbbreviation1621266903776
+    implements MigrationInterface {
+    public async up(queryRunner: QueryRunner): Promise<void> {
+        await queryRunner.query(
+            'DROP TRIGGER IF EXISTS updated_get_fund_transaction_detail_tsvector_insert_update ON "fund_transaction_detail"'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector_insert_update'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector'
+        );
+        await queryRunner.query(
+            'DROP TRIGGER IF EXISTS updated_get_fund_transaction_detail_tsvector_before_update ON "fund_transaction_detail"'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector_before_update'
+        );
+        
+        await queryRunner.query(/*sql*/ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector(target_id UUID)
+            RETURNS TSVECTOR AS $$
+            DECLARE
+                fund_name text;
+                fund_code text;
+                transaction_detail_code_number text;
+                transaction_detail_code_prefix text;
+                parent_transaction_detail_code_number text;
+                parent_transaction_detail_code_prefix text;
+                primary_donor_first_name text;
+                primary_donor_last_name text;
+                source_account_number text;
+                destination_account_number text;
+                source_account_name text;
+                destination_account_name text;
+                source_inst_account_number text;
+                destination_inst_account_number text;
+                source_tenant_account_number text;
+                destination_tenant_account_number text;
+                source_inst_account_name text;
+                destination_inst_account_name text;
+                source_tenant_account_name text;
+                destination_tenant_account_name text;
+                transaction_detail_type text;
+                amount text;
+            BEGIN
+            SELECT
+                COALESCE(f."name", ''),
+                COALESCE(f.fund_code, ''),
+                COALESCE(regexp_replace(ftd.transaction_code, '^[A-Za-z]+-', ''), ''),
+                COALESCE(regexp_replace(ftd.transaction_code, '-\d+', ''), ''),
+                COALESCE(regexp_replace(ft.transaction_code, '^[A-Za-z]+-', ''), ''),
+                COALESCE(regexp_replace(ft.transaction_code, '-\d+', ''), ''),
+                COALESCE(up.first_name, ''),
+                COALESCE(up.last_name, ''),
+                COALESCE(sa.account_number, ''),
+                COALESCE(da.account_number, ''),
+                COALESCE(regexp_replace(sa.title, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(da.title, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(sia.account_number, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(dia.account_number, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(sta.mask, ''),
+                COALESCE(dta.mask, ''),
+                COALESCE(regexp_replace(sia.name, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(dia.name, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(sta.name, ''),
+                COALESCE(dta.name, ''),
+                tdt.name,
+                COALESCE(ABS(TRUNC(ftd.amount::NUMERIC, 2))::TEXT)
+            INTO
+                fund_name,
+                fund_code,
+                transaction_detail_code_number,
+                transaction_detail_code_prefix,
+                parent_transaction_detail_code_number,
+                parent_transaction_detail_code_prefix,
+                primary_donor_first_name,
+                primary_donor_last_name,
+                source_account_number,
+                destination_account_number,
+                source_account_name,
+                destination_account_name,
+                source_inst_account_number,
+                destination_inst_account_number,
+                source_tenant_account_number,
+                destination_tenant_account_number,
+                source_inst_account_name,
+                destination_inst_account_name,
+                source_tenant_account_name,
+                destination_tenant_account_name,
+                transaction_detail_type,
+                amount
+            FROM fund_transaction_detail ftd
+            LEFT JOIN
+                transaction_detail_type tdt ON tdt.id = ftd.transaction_detail_type_id
+            LEFT JOIN
+                fund_transaction ft ON ft.id = ftd.fund_transaction_id
+            LEFT JOIN
+                fund_investment fi ON fi.id = ftd.fund_investment_id
+            LEFT JOIN
+                fund f ON f.id = fi.fund_id
+            LEFT JOIN
+                user_profile up ON up.id = f.created_by_user_profile_id
+            LEFT JOIN
+                gl_account sa ON sa.id = ftd.source_glaccount_id
+            LEFT JOIN
+                gl_account da ON da.id = ftd.destination_glaccount_id
+            LEFT JOIN
+                institution_account sia ON sia.gl_account_id = sa.id
+            LEFT JOIN
+                institution_account dia ON dia.gl_account_id = da.id
+            LEFT JOIN
+                tenant_account sta ON sta.gl_account_id = sa.id
+            LEFT JOIN
+                tenant_account dta ON dta.gl_account_id = da.id
+            WHERE ftd.id = target_id;
+            RETURN to_tsvector(
+                    'pg_catalog.simple',
+                    fund_name || ' ' ||
+                    fund_code || ' ' ||
+                    transaction_detail_code_number || ' ' ||
+                    transaction_detail_code_prefix || ' ' ||
+                    parent_transaction_detail_code_number || ' ' ||
+                    parent_transaction_detail_code_prefix || ' ' ||
+                    primary_donor_first_name || ' ' ||
+                    primary_donor_last_name || ' ' ||
+                    source_account_number || ' ' ||
+                    destination_account_number || ' ' ||
+                    source_account_name || ' ' ||
+                    destination_account_name || ' ' ||
+                    source_inst_account_number || ' ' ||
+                    destination_inst_account_number || ' ' ||
+                    source_tenant_account_number || ' ' ||
+                    destination_tenant_account_number || ' ' ||
+                    source_inst_account_name || ' ' ||
+                    destination_inst_account_name || ' ' ||
+                    source_tenant_account_name || ' ' ||
+                    destination_tenant_account_name || ' ' ||
+                    transaction_detail_type || ' ' ||
+                    amount
+                );
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector_before_update() RETURNS trigger AS $$
+            BEGIN
+                NEW.search_vector := updated_get_fund_transaction_detail_tsvector(NEW.id);
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE TRIGGER updated_get_fund_transaction_detail_tsvector_before_update
+            BEFORE UPDATE ON "fund_transaction_detail"
+            FOR EACH ROW EXECUTE PROCEDURE updated_get_fund_transaction_detail_tsvector_before_update()
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector_insert_update() RETURNS trigger AS $$
+            BEGIN
+                UPDATE fund_transaction_detail
+                SET search_vector = updated_get_fund_transaction_detail_tsvector(NEW.id)
+                WHERE id = NEW.id;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE TRIGGER updated_get_fund_transaction_detail_tsvector_insert_update
+            AFTER INSERT ON "fund_transaction_detail"
+            FOR EACH ROW EXECUTE PROCEDURE updated_get_fund_transaction_detail_tsvector_insert_update()
+        `);
+
+        await queryRunner.query('UPDATE fund_transaction_detail set id = id');
+    }
+
+    public async down(queryRunner: QueryRunner): Promise<void> {
+        await queryRunner.query(
+            'DROP TRIGGER IF EXISTS updated_get_fund_transaction_detail_tsvector_insert_update ON "fund_transaction_detail"'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector_insert_update'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector'
+        );
+        await queryRunner.query(
+            'DROP TRIGGER IF EXISTS updated_get_fund_transaction_detail_tsvector_before_update ON "fund_transaction_detail"'
+        );
+        await queryRunner.query(
+            'DROP FUNCTION IF EXISTS updated_get_fund_transaction_detail_tsvector_before_update'
+        );
+        
+        await queryRunner.query(/*sql*/ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector(target_id UUID)
+            RETURNS TSVECTOR AS $$
+            DECLARE
+                fund_name text;
+                fund_code text;
+                transaction_detail_code_number text;
+                parent_transaction_detail_code_number text;
+                primary_donor_first_name text;
+                primary_donor_last_name text;
+                source_account_number text;
+                destination_account_number text;
+                source_account_name text;
+                destination_account_name text;
+                source_inst_account_number text;
+                destination_inst_account_number text;
+                source_tenant_account_number text;
+                destination_tenant_account_number text;
+                source_inst_account_name text;
+                destination_inst_account_name text;
+                source_tenant_account_name text;
+                destination_tenant_account_name text;
+                transaction_detail_type text;
+                amount text;
+            BEGIN
+            SELECT
+                COALESCE(f."name", ''),
+                COALESCE(f.fund_code, ''),
+                COALESCE(regexp_replace(ftd.transaction_code, '^[A-Za-z]+-', ''), ''),
+                COALESCE(regexp_replace(ft.transaction_code, '^[A-Za-z]+-', ''), ''),
+                COALESCE(up.first_name, ''),
+                COALESCE(up.last_name, ''),
+                COALESCE(sa.account_number, ''),
+                COALESCE(da.account_number, ''),
+                COALESCE(regexp_replace(sa.title, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(da.title, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(sia.account_number, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(dia.account_number, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(sta.mask, ''),
+                COALESCE(dta.mask, ''),
+                COALESCE(regexp_replace(sia.name, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(regexp_replace(dia.name, '[Xx|-]+(\\d+)', ' \\1', 'g'), ''),
+                COALESCE(sta.name, ''),
+                COALESCE(dta.name, ''),
+                tdt.name,
+                COALESCE(ABS(TRUNC(ftd.amount::NUMERIC, 2))::TEXT)
+            INTO
+                fund_name,
+                fund_code,
+                transaction_detail_code_number,
+                parent_transaction_detail_code_number,
+                primary_donor_first_name,
+                primary_donor_last_name,
+                source_account_number,
+                destination_account_number,
+                source_account_name,
+                destination_account_name,
+                source_inst_account_number,
+                destination_inst_account_number,
+                source_tenant_account_number,
+                destination_tenant_account_number,
+                source_inst_account_name,
+                destination_inst_account_name,
+                source_tenant_account_name,
+                destination_tenant_account_name,
+                transaction_detail_type,
+                amount
+            FROM fund_transaction_detail ftd
+            LEFT JOIN
+                transaction_detail_type tdt ON tdt.id = ftd.transaction_detail_type_id
+            LEFT JOIN
+                fund_transaction ft ON ft.id = ftd.fund_transaction_id
+            LEFT JOIN
+                fund_investment fi ON fi.id = ftd.fund_investment_id
+            LEFT JOIN
+                fund f ON f.id = fi.fund_id
+            LEFT JOIN
+                user_profile up ON up.id = f.created_by_user_profile_id
+            LEFT JOIN
+                gl_account sa ON sa.id = ftd.source_glaccount_id
+            LEFT JOIN
+                gl_account da ON da.id = ftd.destination_glaccount_id
+            LEFT JOIN
+                institution_account sia ON sia.gl_account_id = sa.id
+            LEFT JOIN
+                institution_account dia ON dia.gl_account_id = da.id
+            LEFT JOIN
+                tenant_account sta ON sta.gl_account_id = sa.id
+            LEFT JOIN
+                tenant_account dta ON dta.gl_account_id = da.id
+            WHERE ftd.id = target_id;
+            RETURN to_tsvector(
+                    'pg_catalog.simple',
+                    fund_name || ' ' ||
+                    fund_code || ' ' ||
+                    transaction_detail_code_number || ' ' ||
+                    parent_transaction_detail_code_number || ' ' ||
+                    primary_donor_first_name || ' ' ||
+                    primary_donor_last_name || ' ' ||
+                    source_account_number || ' ' ||
+                    destination_account_number || ' ' ||
+                    source_account_name || ' ' ||
+                    destination_account_name || ' ' ||
+                    source_inst_account_number || ' ' ||
+                    destination_inst_account_number || ' ' ||
+                    source_tenant_account_number || ' ' ||
+                    destination_tenant_account_number || ' ' ||
+                    source_inst_account_name || ' ' ||
+                    destination_inst_account_name || ' ' ||
+                    source_tenant_account_name || ' ' ||
+                    destination_tenant_account_name || ' ' ||
+                    transaction_detail_type || ' ' ||
+                    amount
+                );
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector_before_update() RETURNS trigger AS $$
+            BEGIN
+                NEW.search_vector := updated_get_fund_transaction_detail_tsvector(NEW.id);
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE TRIGGER updated_get_fund_transaction_detail_tsvector_before_update
+            BEFORE UPDATE ON "fund_transaction_detail"
+            FOR EACH ROW EXECUTE PROCEDURE updated_get_fund_transaction_detail_tsvector_before_update()
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE OR REPLACE FUNCTION updated_get_fund_transaction_detail_tsvector_insert_update() RETURNS trigger AS $$
+            BEGIN
+                UPDATE fund_transaction_detail
+                SET search_vector = updated_get_fund_transaction_detail_tsvector(NEW.id)
+                WHERE id = NEW.id;
+                RETURN NEW;
+            END
+            $$ LANGUAGE plpgsql
+        `);
+
+        await queryRunner.query(/*sql */ `
+            CREATE TRIGGER updated_get_fund_transaction_detail_tsvector_insert_update
+            AFTER INSERT ON "fund_transaction_detail"
+            FOR EACH ROW EXECUTE PROCEDURE updated_get_fund_transaction_detail_tsvector_insert_update()
+        `);
+
+        await queryRunner.query('UPDATE fund_transaction_detail set id = id');
+    }
+}
