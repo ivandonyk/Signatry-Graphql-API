@@ -1,0 +1,398 @@
+import { Resolver, Ctx, Arg, Mutation, Query } from 'type-graphql';
+import { BaseResolver } from './core/BaseResolver';
+import { GraphQLContext } from '../context';
+import {
+    FundTransactionBatch,
+    FundTransaction,
+    FundTransactionDetail,
+    TransactionStatus,
+    TransactionDetailStatus,
+    TransactionDetailType
+} from '../models';
+import {
+    FundTransactionBatchTypeValue,
+    FundTransactionBatchStatusValue
+} from '../models/FundTransactionBatch';
+import { TransactionStatusValue } from '../models/TransactionStatus';
+import { TransactionDetailStatusValue } from '../models/TransactionDetailStatus';
+import { PermissionLock } from '../decorators/permissionDecorator';
+import { Permissions } from '../types/permissionsList';
+import { getInvestmentUnitPrices } from '../utilities/funds';
+import { TransactionTypeValue } from '../models/TransactionType';
+import { TransactionDetailTypeName } from '../models/TransactionDetailType';
+import { FundTransactionRepository } from '../repositories/FundTransaction';
+import { FundTransactionDetailRepository } from '../repositories/FundTransactionDetail';
+import { EVENTS, eventEmitter } from '../events';
+import { PermissionAccessLevel, PermissionAccessType } from '../models/Permission';
+
+@Resolver(type => FundTransactionBatch)
+export class TransactionBatchResolver extends BaseResolver {
+    @PermissionLock(PermissionAccessType.ADMIN_RECONCILIATION, PermissionAccessLevel.FULL)
+    @Mutation(type => FundTransactionBatch)
+    async createFundTransactionBatch(
+        @Ctx() context: GraphQLContext,
+        @Arg('transactionIds', type => [String]) transactionIds: string[],
+        @Arg('batchType', type => String)
+        batchType: string,
+        @Arg('batchTime', type => Date) batchTime: Date
+    ): Promise<FundTransactionBatch> {
+        const profile = await this.getCurrentUserProfile(context);
+        const manager = context.typeorm.manager;
+
+        // Create fund transaction batch
+        const fundTransactionBatch = manager.create(FundTransactionBatch, {
+            createdBy: profile.id,
+            updatedBy: profile.id,
+            type: batchType as FundTransactionBatchTypeValue
+        });
+
+        // Save batch
+        const { id: fundTransactionBatchId } = await manager.save(fundTransactionBatch);
+
+        let transactionDetailType: TransactionDetailTypeName;
+        let transactionDetailStatus: TransactionDetailStatusValue;
+
+        if (batchType === FundTransactionBatchTypeValue.INVESTMENT) {
+            // For investments, fetch contribution cash transactions that are completed (fully received and reconciled)
+            transactionDetailType = TransactionDetailTypeName.CASH_IN;
+            transactionDetailStatus = TransactionDetailStatusValue.READY_FOR_INVESTMENT;
+        } else if (batchType === FundTransactionBatchTypeValue.DIVESTMENT) {
+            // For divestments, fetch grant cash transactions that are ready for divestment (grant is approved)
+            transactionDetailType = TransactionDetailTypeName.GRANT_DIVESTMENT_CASH;
+            transactionDetailStatus = TransactionDetailStatusValue.READY_FOR_DIVESTMENT;
+        }
+
+        // Get transactions
+        const query = manager
+            .createQueryBuilder(FundTransaction, 'fundTransaction')
+            // Where before timestamp and matching status ID
+            .innerJoinAndSelect('fundTransaction.transactionDetails', 'transactionDetails')
+            .innerJoinAndSelect('transactionDetails.transactionDetailType', 'transactionDetailType')
+            .innerJoinAndSelect(
+                'transactionDetails.transactionDetailStatus',
+                'transactionDetailStatus'
+            )
+            .where('transactionDetailType.name = :detailType', {
+                detailType: transactionDetailType
+            })
+            .andWhere('transactionDetailStatus.name = :name', {
+                name: transactionDetailStatus
+            })
+            .andWhere('fundTransaction.transactionDateTime < :batchTime', {
+                batchTime
+            });
+
+        // Where not in omitted
+        if (transactionIds.length) {
+            query.andWhere('fundTransaction.id NOT IN (:...transactionId)', {
+                transactionId: transactionIds
+            });
+        }
+
+        const transactions = await query.getMany();
+
+        const updateTransactionIds = transactions.map(transaction => {
+            return transaction.id;
+        });
+
+        await manager
+            .getRepository(FundTransaction)
+            .createQueryBuilder('fundTransaction')
+            .update()
+            .set({ fundTransactionBatchId: fundTransactionBatchId })
+            .where('id IN (:...ids)', { ids: updateTransactionIds })
+            .execute();
+
+        return fundTransactionBatch;
+    }
+
+    @PermissionLock(PermissionAccessType.ADMIN_RECONCILIATION, PermissionAccessLevel.READ)
+    @Query(type => FundTransactionBatch, { nullable: true })
+    async getMostRecentBatch(
+        @Ctx() context: GraphQLContext,
+        @Arg('batchType', type => String)
+        batchType: string
+    ): Promise<FundTransactionBatch> {
+        const manager = context.typeorm.manager;
+        const batch = await manager
+            .createQueryBuilder(FundTransactionBatch, 'fundTransactionBatch')
+            .orderBy('fundTransactionBatch.createdOn', 'DESC')
+            .where('fundTransactionBatch.type = :type', {
+                type: batchType
+            })
+            .andWhere('fundTransactionBatch.status = :status', {
+                status: FundTransactionBatchStatusValue.PENDING
+            })
+            .getOne();
+        return batch;
+    }
+
+    @PermissionLock(PermissionAccessType.ADMIN_RECONCILIATION, PermissionAccessLevel.FULL)
+    @Query(type => [FundTransactionBatch], { nullable: true })
+    async getMostRecentOfEachBatch(
+        @Ctx() context: GraphQLContext
+    ): Promise<FundTransactionBatch[]> {
+        const returnArray = [] as FundTransactionBatch[];
+        const manager = context.typeorm.manager;
+        const investment = await manager
+            .createQueryBuilder(FundTransactionBatch, 'fundTransactionBatch')
+            .orderBy('fundTransactionBatch.createdOn', 'DESC')
+            .where('fundTransactionBatch.type = :type', {
+                type: FundTransactionBatchTypeValue.INVESTMENT
+            })
+            .andWhere('fundTransactionBatch.status = :status', {
+                status: FundTransactionBatchStatusValue.PENDING
+            })
+            .getOne();
+        const divestment = await manager
+            .createQueryBuilder(FundTransactionBatch, 'fundTransactionBatch')
+            .orderBy('fundTransactionBatch.createdOn', 'DESC')
+            .where('fundTransactionBatch.type = :type', {
+                type: FundTransactionBatchTypeValue.DIVESTMENT
+            })
+            .andWhere('fundTransactionBatch.status = :status', {
+                status: FundTransactionBatchStatusValue.PENDING
+            })
+            .getOne();
+
+        if (investment) {
+            returnArray.push(investment);
+        }
+        if (divestment) {
+            returnArray.push(divestment);
+        }
+        return returnArray;
+    }
+
+    @PermissionLock(PermissionAccessType.ADMIN_RECONCILIATION, PermissionAccessLevel.FULL)
+    @Mutation(type => [FundTransaction])
+    async submitBatches(
+        @Ctx() context: GraphQLContext,
+        @Arg('batchIds', type => [String]) batchIds: string[]
+    ): Promise<FundTransaction[]> {
+        const { manager } = context.typeorm;
+        const profile = await this.getCurrentUserProfile(context);
+        const divestedStatus = await manager.findOne(TransactionStatus, {
+            name: TransactionStatusValue.APPROVED
+        });
+        const detailPendingStatus = await manager.findOne(TransactionDetailStatus, {
+            name:
+                process.env.RECONCILIATION_ENABLED === 'false'
+                    ? TransactionDetailStatusValue.COMPLETE
+                    : TransactionDetailStatusValue.PENDING_RECONCILIATION
+        });
+        const transactionPendingStatus = await manager.findOne(TransactionStatus, {
+            name:
+                process.env.RECONCILIATION_ENABLED === 'false'
+                    ? TransactionStatusValue.COMPLETE
+                    : TransactionStatusValue.PAID
+        });
+        const detailInvestmentType = await manager.findOne(TransactionDetailType, {
+            name: TransactionDetailTypeName.INVESTMENT
+        });
+
+        const detailDivestmentType = await manager.findOne(TransactionDetailType, {
+            name: TransactionDetailTypeName.DIVESTMENT
+        });
+
+        const fundTransactions = await manager.transaction(async m => {
+            const fundTransactions = await m
+                .createQueryBuilder(FundTransaction, 'fundTransaction')
+                .leftJoinAndSelect('fundTransaction.fund', 'fund')
+                .leftJoinAndSelect('fundTransaction.transactionDetails', 'transactionDetails')
+                .leftJoinAndSelect(
+                    'transactionDetails.transactionDetailType',
+                    'transactionDetailType'
+                )
+                .leftJoinAndSelect(
+                    'transactionDetails.transactionDetailStatus',
+                    'transactionDetailStatus'
+                )
+                .leftJoinAndSelect('fund.investments', 'investments')
+                .leftJoinAndSelect('investments.investment', 'investment')
+                .leftJoinAndSelect('fundTransaction.transactionType', 'transactionType')
+                .where('fundTransaction.fundTransactionBatchId IN (:...batchIds)', { batchIds })
+                .getMany();
+
+            await m
+                .createQueryBuilder()
+                .update(FundTransactionBatch)
+                .set({ status: FundTransactionBatchStatusValue.SUBMITTED })
+                .where('id IN (:...batchIds)', { batchIds })
+                .execute();
+
+            const unresolvedBatches = await m
+                .getRepository(FundTransactionBatch)
+                .createQueryBuilder('batch')
+                .where('status = :status', { status: FundTransactionBatchStatusValue.PENDING })
+                .getMany();
+
+            await Promise.all(
+                unresolvedBatches.map(async batch => {
+                    // unset transactions that were assigned to this batch
+                    const batchTransactions = await m
+                        .createQueryBuilder(FundTransaction, 'fundTransaction')
+                        .where('fundTransaction.fundTransactionBatchId = :batchId', {
+                            batchId: batch.id
+                        })
+                        .getMany();
+
+                    await m.save(
+                        batchTransactions.map(transaction => {
+                            transaction.fundTransactionBatchId = null;
+                            return transaction;
+                        })
+                    );
+
+                    // delete the unresolved batch
+                    return m
+                        .createQueryBuilder()
+                        .delete()
+                        .from(FundTransactionBatch)
+                        .where('id = :id', { id: batch.id })
+                        .execute();
+                })
+            );
+
+            const transactionsRepository = m.getCustomRepository(FundTransactionRepository);
+            const transactionDetailRepository = m.getCustomRepository(
+                FundTransactionDetailRepository
+            );
+
+            return Promise.all(
+                fundTransactions.map(async transaction => {
+                    // get unit prices for the investments associated with this transaction
+                    const unitPrices = await getInvestmentUnitPrices(m);
+
+                    const cashTransactionDetailType =
+                        transaction.transactionType.name === TransactionTypeValue.CONTRIBUTION
+                            ? TransactionDetailTypeName.CASH_IN
+                            : TransactionDetailTypeName.GRANT_DIVESTMENT_CASH;
+
+                    const cashTransactionDetail = await m
+                        .getCustomRepository(FundTransactionDetailRepository)
+                        .getCashDetailForTransaction(transaction, cashTransactionDetailType);
+
+                    let transactionDetails: FundTransactionDetail[];
+
+                    if (transaction.transactionType.name === TransactionTypeValue.CONTRIBUTION) {
+                        let remainder = 0; // Keeps track of amount lost when rounding down to 2 decimal places
+                        transactionDetails = transaction.fund.investments
+                            .filter(i => {
+                                return i.allocationPercentage > 0;
+                            })
+                            .map((i, index, investments) => {
+                                const amount =
+                                    cashTransactionDetail.amount * i.allocationPercentage;
+                                let roundedAmount = Math.floor(amount * 100) / 100;
+                                remainder += amount - roundedAmount;
+                                const units = amount / unitPrices[i.investmentId];
+
+                                // If we're at the last investments, add back in the remainder taken from the previous ones
+                                if (index === investments.length - 1) {
+                                    roundedAmount += remainder;
+                                    roundedAmount = Math.floor(roundedAmount * 100) / 100;
+                                }
+                                return m.create(FundTransactionDetail, {
+                                    transactionDetailStatusId: detailPendingStatus.id,
+                                    transactionDetailTypeId: detailInvestmentType.id,
+                                    fundTransactionId: transaction.id,
+                                    fundInvestmentId: i.id,
+                                    amount: roundedAmount,
+                                    units,
+                                    createdBy: profile.id,
+                                    updatedBy: profile.id,
+                                    resolvedDateTime: new Date()
+                                });
+                            });
+                        transaction.transactionStatusId = transactionPendingStatus.id;
+                    } else if (transaction.transactionType.name === TransactionTypeValue.GRANT) {
+                        const allocations = await transactionsRepository.getDivestmentAllocations(
+                            transaction
+                        );
+
+                        let remainder = 0; // Keeps track of amount lost when rounding down to 2 decimal places
+                        transactionDetails = transaction.fund.investments
+                            .filter(i => {
+                                return i.divestmentPercentage > 0;
+                            })
+                            .map((i, index, investments) => {
+                                const amount =
+                                    -1 * allocations.find(a => a.name === i.investment.name).amount;
+                                let roundedAmount = Math.floor(amount * 100) / 100;
+                                remainder += amount - roundedAmount;
+                                const units = amount / unitPrices[i.investmentId];
+
+                                // If we're at the last investments, add back in the remainder taken from the previous ones
+                                if (index === investments.length - 1) {
+                                    roundedAmount += remainder;
+                                    roundedAmount = Math.floor(roundedAmount * 100) / 100;
+                                }
+                                return m.create(FundTransactionDetail, {
+                                    transactionDetailStatusId: detailPendingStatus.id,
+                                    fundTransactionId: transaction.id,
+                                    transactionDetailTypeId: detailDivestmentType.id,
+                                    fundInvestmentId: i.id,
+                                    amount: roundedAmount,
+                                    units,
+                                    createdBy: profile.id,
+                                    updatedBy: profile.id,
+                                    resolvedDateTime: new Date(),
+                                    transactionDateTime: new Date()
+                                });
+                            });
+
+                        const paymentCashTransactionDetail = await transactionDetailRepository.getCashDetailForTransaction(
+                            transaction,
+                            TransactionDetailTypeName.CASH_OUT
+                        );
+
+                        // If grant is already paid, divesting completes the grant
+                        if (
+                            paymentCashTransactionDetail.transactionDetailStatus.name ===
+                            TransactionDetailStatusValue.COMPLETE
+                        ) {
+                            transaction.transactionStatusId = transactionPendingStatus.id;
+                        }
+
+                        const divestmentCashTransactionDetail = await transactionDetailRepository.getCashDetailForTransaction(
+                            transaction,
+                            TransactionDetailTypeName.GRANT_DIVESTMENT_CASH
+                        );
+
+                        divestmentCashTransactionDetail.transactionDetailStatusId =
+                            detailPendingStatus.id;
+
+                        await transactionDetailRepository.save(divestmentCashTransactionDetail);
+                    }
+
+                    // Add investment/divestment details and update cash detail status
+                    transaction.transactionDetails = transaction.transactionDetails
+                        .concat(transactionDetails)
+                        .map(detail => {
+                            if (detail.id === cashTransactionDetail.id) {
+                                detail.transactionDetailStatusId = detailPendingStatus.id;
+                                detail.transactionDetailStatus = detailPendingStatus;
+                            }
+                            return detail;
+                        });
+
+                    await m.save(transaction.transactionDetails);
+                    const transactionObject = await m.save(transaction);
+                    return transactionObject;
+                })
+            );
+        });
+
+        // Update fund cash holdings
+        for (const transaction of fundTransactions) {
+            if (transaction.transactionType.name === TransactionTypeValue.CONTRIBUTION) {
+                eventEmitter.emit(EVENTS.UPDATE_CONTRIBUTION_CASH_HOLDING, transaction.fundId);
+            } else if (transaction.transactionType.name === TransactionTypeValue.GRANT) {
+                eventEmitter.emit(EVENTS.UPDATE_GRANT_CASH_HOLDING, transaction.fundId);
+            }
+        }
+
+        return fundTransactions;
+    }
+}

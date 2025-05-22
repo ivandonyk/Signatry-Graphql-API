@@ -1,0 +1,125 @@
+import { getOrCreateConnection } from '../typeorm';
+import { FundTransaction, FundTransactionDetail, PoolInvestmentHolding } from '../models';
+import { TransactionDetailType, TransactionDetailTypeName } from '../models/TransactionDetailType';
+import { TransactionStatusValue } from '../models/TransactionStatus';
+import { TransactionTypeValue } from '../models/TransactionType';
+import {
+    TransactionDetailStatus,
+    TransactionDetailStatusValue
+} from '../models/TransactionDetailStatus';
+import { PoolInvestmentHoldingRepository } from '../repositories/PoolInvestmentHolding';
+import { FundInvestmentRepository } from '../repositories/FundInvestment';
+import { EVENTS, eventEmitter } from '../events';
+import { currency } from '../utilities/currency';
+import { dayjs } from '../utilities/datetime';
+import { poolInvestmentUtil } from '../utilities/poolInvestment';
+
+export async function UpdateContributionCashHoldingListener(fundId: string, change: number) {
+    const connection = await getOrCreateConnection();
+    const poolHoldingRepo = connection.getCustomRepository(PoolInvestmentHoldingRepository);
+    const fundInvestmentRepo = connection.getCustomRepository(FundInvestmentRepository);
+
+    async function calculateContributionCashValue(fundId: string): Promise<number> {
+        const contributions = await connection
+            .getRepository(FundTransaction)
+            .createQueryBuilder('fundTransaction')
+            .innerJoinAndSelect(
+                'fundTransaction.transactionStatus',
+                'transactionStatus',
+                'transactionStatus.name NOT IN (:...statusNames)',
+                { statusNames: [TransactionStatusValue.COMPLETE, TransactionStatusValue.CANCELED] }
+            )
+            .innerJoinAndSelect(
+                'fundTransaction.transactionType',
+                'transactionType',
+                'transactionType.name = :typeName',
+                { typeName: TransactionTypeValue.CONTRIBUTION }
+            )
+            .leftJoinAndSelect('fundTransaction.transactionDetails', 'transactionDetails')
+            .leftJoinAndSelect('transactionDetails.transactionDetailType', 'transactionDetailType')
+            .leftJoinAndSelect(
+                'transactionDetails.transactionDetailStatus',
+                'transactionDetailStatus'
+            )
+            .where('fundTransaction.fundId = :fundId', { fundId: fundId })
+            .getMany();
+
+        const amount = contributions.reduce((sum: number, contribution: FundTransaction) => {
+            const cashDetail = contribution.transactionDetails.find(detail => {
+                return detail.transactionDetailType.name === TransactionDetailTypeName.CASH_IN;
+            });
+
+            // Cash not yet posted to bank account
+            if (cashDetail.transactionDetailStatus.name !== TransactionDetailStatusValue.COMPLETE) {
+                return sum;
+            }
+
+            const completeInvestmentAmount = contribution.transactionDetails
+                .filter(detail => {
+                    return (
+                        detail.transactionDetailType.name === TransactionDetailTypeName.INVESTMENT
+                    );
+                })
+                .reduce((sum, detail) => {
+                    if (
+                        detail.transactionDetailStatus.name ===
+                        TransactionDetailStatusValue.COMPLETE
+                    ) {
+                        sum = currency.add(sum, detail.amount);
+                    }
+                    return sum;
+                }, 0);
+
+            // Amount left in bank account that hasn't been invested
+            const totalAmount = currency.subtract(cashDetail.amount, completeInvestmentAmount);
+
+            return currency.add(sum, totalAmount);
+        }, 0);
+
+        return amount;
+    }
+
+    const currentHolding = await poolHoldingRepo.getCurrentContributionCashHoldingForFund(fundId);
+    const fundInvestment = await fundInvestmentRepo.getContributionCashInvestmentForFund(fundId);
+    const startOfToday = dayjs()
+        .startOf('day')
+        .toDate();
+
+    if (!currentHolding) {
+        const amount = await calculateContributionCashValue(fundId);
+        await poolHoldingRepo.save(
+            poolHoldingRepo.create({
+                date: new Date(),
+                units: amount,
+                marketValue: amount,
+                unitPrice: 1,
+                fundInvestmentId: fundInvestment.id,
+                cumulativeAverageCost: 0,
+                cumulativeRealized: 0,
+                cumulativeUnrealized: 0
+            })
+        );
+    } else {
+        const amount = currency.add(currentHolding.marketValue, change);
+        if (currentHolding.date < startOfToday) {
+            await poolHoldingRepo.save(
+                poolHoldingRepo.create({
+                    date: new Date(),
+                    units: amount,
+                    marketValue: amount,
+                    unitPrice: 1,
+                    fundInvestmentId: fundInvestment.id,
+                    cumulativeAverageCost: 0,
+                    cumulativeRealized: 0,
+                    cumulativeUnrealized: 0
+                })
+            );
+        } else {
+            await poolHoldingRepo.update(currentHolding.id, {
+                units: amount,
+                marketValue: amount,
+                date: new Date()
+            });
+        }
+    }
+}

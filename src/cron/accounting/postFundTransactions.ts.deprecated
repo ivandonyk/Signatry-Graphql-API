@@ -1,0 +1,110 @@
+import { AccountingFacade, JournalEntryInterface } from '../../accounting';
+import { Fund, FundTransaction, GLAccount, UserProfile, LocationEntity } from '../../models';
+import { getOrCreateConnection } from '../../typeorm';
+import { TransactionStatusValue } from '../../models/TransactionStatus';
+import { TransactionTypeValue } from '../../models/TransactionType';
+import { GLAccountRepository } from '../../repositories/GLAccount';
+import { GLAccountTypeName } from '../../models/GLAccountType';
+import { LocationEntityRepository } from '../../repositories/LocationEntity';
+import dayjs from 'dayjs';
+
+export async function postContributionJournalEntries() {
+    const accounting = new AccountingFacade();
+    const connection = await getOrCreateConnection();
+    const repo = connection.getRepository(FundTransaction);
+    const glAccountRepo = connection.getCustomRepository(GLAccountRepository);
+
+    // Location entity for all transactions related to DAFs
+    const dafLocationEntity = await connection
+        .getCustomRepository(LocationEntityRepository)
+        .getDAFLocationEntity();
+
+    // Account into which fund contributions are paid
+    const primaryGLAccount = await glAccountRepo.getByType(GLAccountTypeName.PRIMARY);
+
+    // Account that tracks contribution revenue
+    const contributionRevenueAccount = await glAccountRepo.getByType(
+        GLAccountTypeName.CONTRIBUTION_REVENUE
+    );
+
+    // Account that tracks credit card fee expenses
+    const creditCardFeeAccount = await glAccountRepo.getByType(GLAccountTypeName.CREDIT_CARD_FEES);
+
+    async function processFundTransactions(
+        transactions: FundTransaction[]
+    ): Promise<JournalEntryInterface[]> {
+        const journalEntries = [];
+        for (const transaction of transactions) {
+            const user = await connection.getRepository(UserProfile).findOne(transaction.createdBy);
+            const fund = transaction.fund;
+            const feeTransaction = await connection
+                .getRepository(FundTransaction)
+                .createQueryBuilder('fundTransaction')
+                .leftJoin('fundTransaction.transactionType', 'transactionType')
+                .where('transactionType.name = :type', { type: TransactionTypeValue.FEE })
+                .andWhere('fundTransaction.fundTransactionSourceId = :id', {
+                    id: transaction.fundTransactionSourceId
+                })
+                .getOne();
+
+            // Skip if user or fund are missing accounting IDs
+            if (!user.accountingCustomerId || !fund.accountingProjectId) continue;
+            const creditEntry = accounting.createJournalEntryObject(
+                contributionRevenueAccount.accountNumber,
+                `Contribution ${transaction.transactionCode}`,
+                (transaction.amount + feeTransaction.amount) * -1,
+                fund.accountingProjectId,
+                user.accountingCustomerId,
+                dafLocationEntity.locationId
+            );
+            const debitEntry = accounting.createJournalEntryObject(
+                primaryGLAccount.accountNumber,
+                `Contribution ${transaction.transactionCode}`,
+                transaction.amount,
+                fund.accountingProjectId,
+                user.accountingCustomerId,
+                dafLocationEntity.locationId
+            );
+            journalEntries.push(creditEntry);
+            journalEntries.push(debitEntry);
+
+            const feeDebitEntry = accounting.createJournalEntryObject(
+                creditCardFeeAccount.accountNumber,
+                `Credit card processing fee for contribution ${transaction.transactionCode}`,
+                feeTransaction.amount,
+                fund.accountingProjectId,
+                user.accountingCustomerId,
+                dafLocationEntity.locationId,
+                [['GLDIM990FUNCTIONAL_EXPENSE_GROUP', '10003']]
+            );
+            journalEntries.push(feeDebitEntry);
+        }
+        return journalEntries;
+    }
+
+    let reconciledContributions = await repo
+        .createQueryBuilder('fundTransaction')
+        .innerJoinAndSelect('fundTransaction.transactionStatus', 'status')
+        .innerJoinAndSelect('fundTransaction.fund', 'fund')
+        .innerJoinAndSelect('user_profile', 'user', 'fundTransaction.createdBy = user.id')
+        .innerJoinAndSelect('fundTransaction.transactionType', 'transactionType')
+        .where('status.name = :status', { status: TransactionStatusValue.READY_FOR_INVESTMENT })
+        .andWhere('fundTransaction.ledgerId IS NULL')
+        .andWhere('fund.accountingProjectId IS NOT NULL')
+        .andWhere('user.accountingCustomerId IS NOT NULL')
+        .andWhere('transactionType.name = :type', { type: TransactionTypeValue.CONTRIBUTION })
+        .getMany();
+    if (reconciledContributions.length > 0) {
+        const entries = await processFundTransactions(reconciledContributions);
+        const today = dayjs().format('YYYY-MM-DD HH:mm');
+        const batchId = await accounting.createJournalEntryBatch(
+            entries,
+            `DAF contributions for ${today}`
+        );
+        reconciledContributions = reconciledContributions.map(transaction => {
+            transaction.ledgerId = batchId;
+            return transaction;
+        });
+        await repo.save(reconciledContributions);
+    }
+}
